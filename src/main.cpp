@@ -1,49 +1,52 @@
 // =============================================================
-//  Generic USB/IP Server (device name set in .env)
-//  Hardware: ESP32-S3-N16R8 or ESP32-S3 Super Mini
+//  ESP32-S3 USB/IP Bridge
+//  Hardware: ESP32-S3-N16R8 (16MB Flash / 8MB PSRAM)
 //
-//  Exposes a USB device (e.g. a printer) over WiFi via USB/IP so any
-//  PC on the network can attach it as if it were plugged in directly.
+//  Design: Pure USB/IP bridge.
+//    Windows installs the real printer driver on the virtual USB
+//    device provided by USB/IP.  All printing, maintenance, and
+//    vendor utilities work exactly as if the printer were plugged
+//    directly into the PC via USB.
 //
-//  Client setup:
-//    usbip attach -r <ESP32_IP> -b 1-1   (or use the USBIP-Client tray app)
+//  Windows setup (one-time):
+//    winget install usbipd
+//    usbip attach -r <ESP32_IP> -b 1-1
+//    → Windows detects the printer, installs driver, done.
 //
 //  Ports:
-//    3240 — USB/IP
+//    3240 — USB/IP  (primary — printing + maintenance)
 //    80   — Web UI  (WiFi setup + status dashboard)
-//  Logs: crash-surviving, viewable on the web dashboard (Logs card)
+//    23   — Telnet  (RemoteDebug — live debug output)
 // =============================================================
-
 #include <WiFi.h>
 #include <ArduinoOTA.h>
 #include <esp_task_wdt.h>
-#include <esp_system.h>
-
-#include <EspUsbIpServer.h>
 
 #include "config.h"
-#include "applog.h"
-#include "persist_log.h"
+#include "rdebug.h"
+#include "usb_device.h"
 #include "wifi_manager.h"
+#include "usbip_server.h"
 #include "web_ui.h"
 
-// ── Status LED ───────────────────────────────────────────────────────────────
-// Plain GPIO LED, or WS2812 (Super Mini, GPIO48) when built with -DLED_RGB.
-static bool ledState = false;
-static void setLed(bool on) {
-    ledState = on;
-#ifdef LED_RGB
-    neopixelWrite(LED_PIN, 0, on ? 32 : 0, 0);   // dim green
-#else
-    digitalWrite(LED_PIN, on ? HIGH : LOW);
-#endif
-}
-
 // ── Global objects ────────────────────────────────────────────────────────────
+RemoteDebug Debug;
+
 UsbDevice   usbDevice;
 WiFiManager wifiMgr;
 UsbIpServer usbip;
 WebUI       webUI(wifiMgr, usbDevice, usbip);
+
+TaskHandle_t usbTaskHandle = NULL;
+
+// ── USB Host background task (Core 1) ─────────────────────────────────────────
+void usbHostTask(void*) {
+    debugI("USB Host task running on Core 1");
+    while (true) {
+        usbDevice.task();
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
 
 void setupOTA() {
     ArduinoOTA.setHostname(OTA_HOSTNAME);
@@ -55,74 +58,76 @@ void setupOTA() {
     debugI("OTA ready on %s.local (port 3232)", OTA_HOSTNAME);
 }
 
-// ── setup() ──────────────────────────────────────────────────────────────────
+// ── setup() ───────────────────────────────────────────────────────────────────
 void setup() {
+    // Keep Serial for early boot messages via hardware UART (GPIO43/44).
+    // After WiFi is up, RemoteDebug Telnet takes over. With setSerialEnabled(true)
+    // all debug macros also echo to Serial, so nothing is lost.
     Serial.begin(115200);
     delay(1000);
 
-    PersistLog::begin();   // first: captures reset reason, saves previous boot's log
-
     Serial.println();
     Serial.println("===========================================");
-    Serial.println("  " DEVICE_NAME " — USB/IP Server");
-    Serial.println("  Firmware: " __DATE__ "  " __TIME__);
+    Serial.println("  USB/IP Bridge  v2.0  [" DEVICE_NAME "]");
+    Serial.println("  Full USB over WiFi -- print + maintain");
     Serial.println("===========================================");
-    Serial.printf("  Heap: %dKB   PSRAM: %dKB\n",
+    Serial.printf("  Heap: %dKB   PSRAM: %dKB\n\n",
                   ESP.getFreeHeap()/1024, ESP.getFreePsram()/1024);
-    // Why did we (re)boot? 3=SW 4=PANIC 5=INT_WDT 6=TASK_WDT 7=WDT 9=BROWNOUT
-    Serial.printf("  Reset reason: %d\n\n", (int)esp_reset_reason());
 
-#ifndef LED_RGB
     pinMode(LED_PIN, OUTPUT);
-#endif
-    setLed(false);
+    digitalWrite(LED_PIN, LOW);
 
-    // 1 — USB Host (spawns task on opposite core automatically)
-    usbDevice.begin();
+    // 1 — USB Host (runs on Core 1)
+    if (usbDevice.begin()) {
+        xTaskCreatePinnedToCore(usbHostTask, "usb_host",
+                                USB_HOST_TASK_STACK_SIZE, NULL,
+                                USB_HOST_TASK_PRIORITY, &usbTaskHandle, 1);
+    }
 
     // 2 — WiFi
     wifiMgr.begin();
 
+    // 3 — RemoteDebug (Telnet port 23, only after WiFi is up)
+    Debug.begin(MDNS_HOSTNAME);
+    Debug.setResetCmdEnabled(true);
+    Debug.setSerialEnabled(true);   // mirror all debugX() calls to Serial too
+    debugI("RemoteDebug started — connect: telnet %s.local", MDNS_HOSTNAME);
 
     if (wifiMgr.isConnected()) setupOTA();
 
-    // 4 — USB/IP bridge (spawns its own task on this core, port 3240)
+    // 4 — USB/IP bridge (port 3240)
     usbip.begin(&usbDevice);
-
-    usbip.onClientConnect([](const char* ip) {
-        debugI("Device claimed by %s", ip);
-    });
-    usbip.onClientDisconnect([](const char* ip, uint32_t sec) {
-        debugI("Device released by %s after %us", ip, sec);
-        PersistLog::flushNow();   // keep the log of the job that just finished
-    });
 
     // 5 — Web dashboard (port 80)
     webUI.begin();
 
-    // 6 — Watchdog
+    // 6 — Watchdog (ESP-IDF 4.x API: seconds, panic-on-timeout)
     esp_task_wdt_init(WDT_TIMEOUT_SEC, true);
     esp_task_wdt_add(NULL);
 
     if (wifiMgr.isConnected()) {
         debugI("IP:        %s",        wifiMgr.getIP().c_str());
         debugI("Dashboard: http://%s", wifiMgr.getIP().c_str());
-        debugI("Attach:    usbip attach -r %s -b 1-1", wifiMgr.getIP().c_str());
+        debugI("USB/IP:    usbip attach -r %s -b 1-1", wifiMgr.getIP().c_str());
+        debugI("Debug:     telnet %s:23", wifiMgr.getIP().c_str());
     } else {
-        debugW("No WiFi — connect to AP '%s', open http://192.168.4.1", AP_SSID);
+        debugW("No WiFi — connect to AP '%s', then open http://%s",
+               AP_SSID, wifiMgr.getIP().c_str());
     }
 
-    setLed(wifiMgr.isConnected());
+    digitalWrite(LED_PIN, wifiMgr.isConnected() ? HIGH : LOW);
 }
 
-// ── loop() ───────────────────────────────────────────────────────────────────
+// ── loop() ────────────────────────────────────────────────────────────────────
 void loop() {
     esp_task_wdt_reset();
 
     wifiMgr.task();
+    usbip.task();
     webUI.task();
-    PersistLog::task();
+    Debug.handle();
 
+    // Re-init OTA if WiFi reconnected after a drop
     static bool otaUp = false;
     if (wifiMgr.isConnected()) {
         if (!otaUp) { setupOTA(); otaUp = true; }
@@ -131,12 +136,12 @@ void loop() {
         otaUp = false;
     }
 
-    // LED: slow blink = device in use, solid = idle+ready, off = no WiFi
+    // LED: slow blink = USB/IP attached, solid = idle+ready, off = no WiFi
     static unsigned long lastBlink = 0;
     if (usbip.isClientAttached()) {
-        if (millis() - lastBlink > 500) { lastBlink = millis(); setLed(!ledState); }
+        if (millis() - lastBlink > 500) { lastBlink = millis(); digitalWrite(LED_PIN, !digitalRead(LED_PIN)); }
     } else {
-        setLed(wifiMgr.isConnected());
+        digitalWrite(LED_PIN, wifiMgr.isConnected() ? HIGH : LOW);
     }
 
     delay(1);
